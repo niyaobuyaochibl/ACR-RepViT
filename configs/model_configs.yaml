@@ -1,0 +1,115 @@
+# ACR-RepViT Model Configurations
+# Used for reproducible experiments in the paper
+
+# Baseline RepViT-M0.9
+repvit_m0_9:
+  type: "repvit"
+  depths: [1, 2, 4, 1]
+  dims: [48, 96, 192, 384]
+  kernel_size: 3
+  mlp_ratio: 4.0
+  drop_rate: 0.0
+  drop_path_rate: 0.1
+  layer_scale_init_value: 1e-5
+  expected_params: "5.49M"
+  expected_flops: "0.87G"
+
+# ACR-RepViT with CBAM
+acr_repvit_m0_9_cbam:
+  type: "acr_repvit_cbam"
+  depths: [1, 2, 4, 1]
+  dims: [48, 96, 192, 384]
+  kernel_size: 3
+  mlp_ratio: 4.0
+  drop_rate: 0.0
+  drop_path_rate: 0.1
+  layer_scale_init_value: 1e-5
+  cbam_ratio: 8
+  cbam_kernel_size: 7
+  expected_params: "7.30M"
+  expected_flops: "0.92G"
+
+# ACR-RepViT with Channel Attention only
+acr_repvit_m0_9_ca:
+  type: "acr_repvit_ca"
+  depths: [1, 2, 4, 1]
+  dims: [48, 96, 192, 384]
+  kernel_size: 3
+  mlp_ratio: 4.0
+  drop_rate: 0.0
+  drop_path_rate: 0.1
+  layer_scale_init_value: 1e-5
+  ca_ratio: 8
+  expected_params: "3.26M"
+  expected_flops: "0.81G"
+
+# ACR-RepViT with Spatial Attention only
+acr_repvit_m0_9_sa:
+  type: "acr_repvit_sa"
+  depths: [1, 2, 4, 1]
+  dims: [48, 96, 192, 384]
+  kernel_size: 3
+  mlp_ratio: 4.0
+  drop_rate: 0.0
+  drop_path_rate: 0.1
+  layer_scale_init_value: 1e-5
+  sa_kernel_size: 7
+  expected_params: "3.26M"
+  expected_flops: "0.82G"
+
+# ACR-RepViT with Multi-scale convolution
+acr_repvit_m0_9_multiscale:
+  type: "acr_repvit_multiscale"
+  depths: [1, 2, 4, 1]
+  dims: [48, 96, 192, 384]
+  kernel_size: 3
+  mlp_ratio: 4.0
+  drop_rate: 0.0
+  drop_path_rate: 0.1
+  layer_scale_init_value: 1e-5
+  multiscale_kernels: [3, 5]
+  expected_params: "4.07M"
+  expected_flops: "0.63G"
+
+# Training configurations
+training:
+  # Common settings for all variants
+  common:
+    optimizer: "adamw"
+    weight_decay: 0.05
+    epochs: 270
+    batch_size: 256
+    scheduler: "cosine"
+  
+  # CA/SA variants (using main.py)
+  ca_sa_variants:
+    script: "main.py"
+    lr: 0.005
+    warmup_epochs: 5
+    warmup_lr: 1e-5
+    distributed: true
+    master_ports:
+      ca: 12346
+      sa: 12347
+    
+  # CBAM/MultiScale variants (using acr_train.py)  
+  cbam_multiscale_variants:
+    script: "acr_train.py"
+    lr: 0.001
+    warmup_epochs: 20
+    early_stopping: true
+    patience: 15
+    distributed: false
+
+# Evaluation configuration
+evaluation:
+  batch_size: 256
+  crop_pct: 0.875
+  interpolation: "bicubic"
+  
+# Hardware configuration  
+hardware:
+  num_gpus: 4
+  num_workers: 8
+  pin_memory: true
+  use_amp: true  # Automatic Mixed Precision

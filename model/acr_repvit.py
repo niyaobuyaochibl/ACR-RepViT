@@ -1,0 +1,863 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import random
+from timm.models.registry import register_model
+from timm.models.layers import SqueezeExcite, DropPath
+from model.repvit import _make_divisible, RepVGGDW, Conv2d_BN, Residual, Classfier
+
+# 常用组件
+def act_layer():
+    return nn.GELU()
+
+class ConvNorm(nn.Sequential):
+    def __init__(self, in_chs, out_chs, kernel_size=1, stride=1, pad=0, dilation=1,
+                 groups=1, bn_weight_init=1):
+        super().__init__()
+        # 处理组卷积参数，确保in_chs可以被groups整除
+        if groups > 1 and in_chs % groups != 0:
+            print(f"警告：输入通道 {in_chs} 不能被组数 {groups} 整除，调整为 1")
+            groups = 1
+        
+        # 卷积层
+        self.add_module('c', nn.Conv2d(in_chs, out_chs, kernel_size, stride, pad, dilation, groups, bias=False))
+        # 批归一化层
+        self.add_module('bn', nn.BatchNorm2d(out_chs))
+        
+    @torch.no_grad()
+    def fuse(self):
+        c, bn = self._modules.values()
+        w = bn.weight / (bn.running_var + bn.eps)**0.5
+        w = c.weight * w.reshape(-1, 1, 1, 1)
+        b = bn.bias - bn.running_mean * bn.weight / (bn.running_var + bn.eps)**0.5
+        
+        # 获取当前设备
+        device = w.device
+        
+        # 确保分组参数正确
+        groups = c.groups
+        in_channels = w.size(1) * groups
+        if groups > 0 and in_channels % groups != 0:
+            # 如果通道数不能被组数整除，重置为1
+            groups = 1
+            
+        # 创建新卷积层时确保通道数和组数兼容
+        m = nn.Conv2d(in_channels, w.size(0), w.size(2), c.stride, c.padding, c.dilation, groups, True)
+        
+        # 确保在正确的设备上
+        m = m.to(device)
+        
+        # 如果是组卷积，确保权重形状正确
+        if groups > 1:
+            # 对于DW卷积，可能需要复制权重向量
+            if w.size(1) == 1:
+                w = w.repeat(1, m.weight.size(1) // groups, 1, 1)
+        
+        m.weight.data.copy_(w)
+        m.bias.data.copy_(b)
+        return m
+
+# 分解卷积重参数化
+class DecomposedConv(nn.Module):
+    def __init__(self, dim, kernel_size=3, stride=1, padding=1):
+        super().__init__()
+        self.dim = dim
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        
+        # 标准DW卷积
+        self.dw = ConvNorm(dim, dim, kernel_size, stride, padding, groups=dim)
+        # 分解为1x3卷积
+        self.h_conv = ConvNorm(dim, dim, (1, kernel_size), stride, (0, padding), groups=dim)
+        # 分解为3x1卷积
+        self.v_conv = ConvNorm(dim, dim, (kernel_size, 1), stride, (padding, 0), groups=dim)
+        
+        # 恒等映射
+        self.identity = nn.Identity() if stride == 1 else None
+        
+    def forward(self, x):
+        out = self.dw(x) + self.h_conv(x) + self.v_conv(x)
+        if self.identity is not None:
+            out = out + x
+        return out
+        
+    @torch.no_grad()    
+    def fuse(self):
+        # 融合所有分支为一个等效的卷积
+        dw, h_dw, v_dw = self.dw.fuse(), self.h_conv.fuse(), self.v_conv.fuse()
+        
+        # 获取当前设备
+        device = dw.weight.device
+        
+        # 合并权重
+        fused_w = dw.weight.clone()
+        fused_b = dw.bias.clone()
+        
+        # 添加水平卷积权重
+        fused_w += F.pad(h_dw.weight, [0, 0, 1, 1])
+        fused_b += h_dw.bias
+        
+        # 添加垂直卷积权重
+        fused_w += F.pad(v_dw.weight, [1, 1, 0, 0])
+        fused_b += v_dw.bias
+        
+        # 创建融合后的卷积，确保groups参数正确
+        # 处理极端情况
+        if self.dim <= 0:
+            print(f"警告：输入维度为 {self.dim}，已修正为 1")
+            groups = 1
+            dim = 1
+        else:
+            groups = self.dim
+            dim = self.dim
+            
+        fused_conv = nn.Conv2d(dim, dim, self.kernel_size, 
+                           self.stride, self.padding, bias=True, 
+                           groups=groups)
+                           
+        # 确保权重在正确的设备上
+        fused_conv = fused_conv.to(device)
+        fused_conv.weight.data = fused_w
+        fused_conv.bias.data = fused_b
+        
+        # 如果有恒等映射，也要融合进去
+        if self.identity is not None:
+            identity_weight = torch.zeros_like(fused_w)
+            identity_weight[:, :, 1, 1] = 1.0
+            identity_bias = torch.zeros_like(fused_b)
+            
+            fused_conv.weight.data += identity_weight
+            fused_conv.bias.data += identity_bias
+            
+        return fused_conv
+
+# 多尺度卷积重参数化
+class MultiScaleConv(nn.Module):
+    def __init__(self, dim, kernel_size=3, stride=1, padding=1):
+        super().__init__()
+        self.dim = dim
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        
+        # 标准DW卷积 3x3
+        self.dw3 = ConvNorm(dim, dim, 3, stride, 1, groups=dim)
+        # 小尺度DW卷积 5x5
+        self.dw5 = ConvNorm(dim, dim, 5, stride, 2, groups=dim)
+        # 恒等映射
+        self.identity = nn.Identity() if stride == 1 else None
+        
+    def forward(self, x):
+        out = self.dw3(x) + self.dw5(x)
+        if self.identity is not None:
+            out = out + x
+        return out
+    
+    @torch.no_grad()
+    def fuse(self):
+        # 融合所有分支为一个等效的卷积
+        dw3, dw5 = self.dw3.fuse(), self.dw5.fuse()
+        
+        # 获取当前设备
+        device = dw3.weight.device
+        
+        # 处理极端情况
+        if self.dim <= 0:
+            print(f"警告：输入维度为 {self.dim}，已修正为 1")
+            groups = 1
+            dim = 1
+        else:
+            groups = self.dim
+            dim = self.dim
+        
+        # 创建5x5卷积，确保groups参数正确
+        fused_conv = nn.Conv2d(dim, dim, 5, 
+                            self.stride, 2, bias=True,
+                            groups=groups)
+        # 确保在正确的设备上
+        fused_conv = fused_conv.to(device)
+        
+        # 初始化权重和偏置
+        fused_w = torch.zeros_like(fused_conv.weight)
+        fused_b = dw3.bias.clone() + dw5.bias.clone()
+        
+        # 融合3x3卷积到5x5卷积
+        fused_w[:, :, 1:4, 1:4] += dw3.weight
+        
+        # 添加5x5卷积权重
+        fused_w += dw5.weight
+        
+        # 如果有恒等映射，也要融合进去
+        if self.identity is not None:
+            identity_weight = torch.zeros_like(fused_w)
+            identity_weight[:, :, 2, 2] = 1.0
+            identity_bias = torch.zeros_like(fused_b)
+            
+            fused_w += identity_weight
+            fused_b += identity_bias
+            
+        fused_conv.weight.data = fused_w
+        fused_conv.bias.data = fused_b
+        
+        return fused_conv
+    
+# 通道注意力
+class ChannelAttention(nn.Module):
+    def __init__(self, dim, reduction=16, act_layer=nn.ReLU):
+        super().__init__()
+        self.dim = dim
+        self.reduction = reduction
+        hidden_dim = dim // reduction
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv_down = ConvNorm(dim, hidden_dim, 1, 1, 0)
+        self.act = act_layer()
+        self.conv_up = ConvNorm(hidden_dim, dim, 1, 1, 0)
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, x):
+        attn = self.avg_pool(x)
+        attn = self.conv_down(attn)
+        attn = self.act(attn)
+        attn = self.conv_up(attn)
+        attn = self.sigmoid(attn)
+        return x * attn
+        
+    @torch.no_grad()
+    def fuse(self):
+        # 返回自身，不进行融合
+        return self
+
+# 注意力增强重参数化
+class AttentionConv(nn.Module):
+    def __init__(self, dim, kernel_size=3, stride=1, padding=1):
+        super().__init__()
+        self.dim = dim
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        
+        # 标准DW卷积
+        self.dw = ConvNorm(dim, dim, kernel_size, stride, padding, groups=dim)
+        # 通道注意力
+        self.ca = ChannelAttention(dim)
+        # 恒等映射
+        self.identity = nn.Identity() if stride == 1 else None
+        
+    def forward(self, x):
+        out = self.dw(x) + self.ca(x)
+        if self.identity is not None:
+            out = out + x
+        return out
+        
+    @torch.no_grad()
+    def fuse(self):
+        # 只融合DW卷积和恒等映射，保留注意力模块
+        dw = self.dw.fuse()
+        
+        # 创建融合后的层
+        class FusedDwAttn(nn.Module):
+            def __init__(self, dw_conv, ca, identity=None):
+                super().__init__()
+                self.dw = dw_conv
+                self.ca = ca
+                self.identity = identity
+                
+            def forward(self, x):
+                out = self.dw(x)
+                out = out + self.ca(x)
+                if self.identity is not None:
+                    out = out + x
+                return out
+                
+        # 返回融合后的层
+        return FusedDwAttn(dw, self.ca, self.identity)
+
+# 通道注意力模块
+class ChannelAttentionModule(nn.Module):
+    def __init__(self, dim, reduction=16):
+        super().__init__()
+        self.ca = ChannelAttention(dim, reduction)
+        
+    def forward(self, x):
+        return self.ca(x)
+    
+    @torch.no_grad()
+    def fuse(self):
+        return self
+
+# 空间注意力模块
+class SpatialAttentionModule(nn.Module):
+    def __init__(self, dim, kernel_size=7):
+        super().__init__()
+        self.sa = SpatialAttention(kernel_size=kernel_size)
+        
+    def forward(self, x):
+        return self.sa(x)
+    
+    @torch.no_grad()
+    def fuse(self):
+        return self
+
+# RepViT Token Mixer
+class RepViTTokenMixer(nn.Module):
+    def __init__(self, dim, mode='decomposed', stride=1):
+        super().__init__()
+        self.dim = dim
+        self.mode = mode
+        
+        if mode == 'decomposed':
+            self.mixer = DecomposedConv(dim, kernel_size=3, stride=stride, padding=1)
+        elif mode == 'multiscale':
+            self.mixer = MultiScaleConv(dim, kernel_size=3, stride=stride, padding=1)
+        elif mode == 'attention':
+            self.mixer = AttentionConv(dim, kernel_size=3, stride=stride, padding=1)
+        elif mode == 'cbam':
+            # 使用CBAM注意力机制
+            self.dw = ConvNorm(dim, dim, 3, stride, 1, groups=dim)
+            self.cbam = CBAMModule(dim)
+            self.identity = nn.Identity() if stride == 1 else None
+        elif mode == 'ca_only':
+            # 只使用通道注意力机制
+            self.dw = ConvNorm(dim, dim, 3, stride, 1, groups=dim)
+            self.ca = ChannelAttentionModule(dim)
+            self.identity = nn.Identity() if stride == 1 else None
+        elif mode == 'sa_only':
+            # 只使用空间注意力机制
+            self.dw = ConvNorm(dim, dim, 3, stride, 1, groups=dim)
+            self.sa = SpatialAttentionModule(dim)
+            self.identity = nn.Identity() if stride == 1 else None
+        elif mode == 'combined':
+            # 组合使用多尺度卷积和CBAM注意力
+            self.multiscale = MultiScaleConv(dim, kernel_size=3, stride=stride, padding=1)
+            self.cbam = CBAMModule(dim)
+            self.identity = nn.Identity() if stride == 1 else None
+        else:
+            # 默认使用普通的DW卷积
+            self.mixer = ConvNorm(dim, dim, 3, stride, 1, groups=dim)
+            
+    def forward(self, x):
+        if self.mode == 'cbam':
+            out = self.dw(x) + self.cbam(x)
+            if self.identity is not None:
+                out = out + x
+            return out
+        elif self.mode == 'ca_only':
+            out = self.dw(x) + self.ca(x)
+            if self.identity is not None:
+                out = out + x
+            return out
+        elif self.mode == 'sa_only':
+            out = self.dw(x) + self.sa(x)
+            if self.identity is not None:
+                out = out + x
+            return out
+        elif self.mode == 'combined':
+            out = self.multiscale(x) + self.cbam(x)
+            if self.identity is not None:
+                out = out + x
+            return out
+        else:
+            return self.mixer(x)
+        
+    def fuse(self):
+        if self.mode == 'cbam':
+            dw = self.dw.fuse()
+            
+            class FusedDwCbam(nn.Module):
+                def __init__(self, dw_conv, cbam, identity=None):
+                    super().__init__()
+                    self.dw = dw_conv
+                    self.cbam = cbam
+                    self.identity = identity
+                    
+                def forward(self, x):
+                    out = self.dw(x) + self.cbam(x)
+                    if self.identity is not None:
+                        out = out + x
+                    return out
+                    
+            return FusedDwCbam(dw, self.cbam, self.identity)
+        elif self.mode == 'ca_only':
+            dw = self.dw.fuse()
+            
+            class FusedDwCa(nn.Module):
+                def __init__(self, dw_conv, ca, identity=None):
+                    super().__init__()
+                    self.dw = dw_conv
+                    self.ca = ca
+                    self.identity = identity
+                    
+                def forward(self, x):
+                    out = self.dw(x) + self.ca(x)
+                    if self.identity is not None:
+                        out = out + x
+                    return out
+                    
+            return FusedDwCa(dw, self.ca, self.identity)
+        elif self.mode == 'sa_only':
+            dw = self.dw.fuse()
+            
+            class FusedDwSa(nn.Module):
+                def __init__(self, dw_conv, sa, identity=None):
+                    super().__init__()
+                    self.dw = dw_conv
+                    self.sa = sa
+                    self.identity = identity
+                    
+                def forward(self, x):
+                    out = self.dw(x) + self.sa(x)
+                    if self.identity is not None:
+                        out = out + x
+                    return out
+                    
+            return FusedDwSa(dw, self.sa, self.identity)
+        elif self.mode == 'combined':
+            # 融合多尺度卷积，保留CBAM
+            multiscale = self.multiscale.fuse()
+            
+            class FusedMultiscaleCbam(nn.Module):
+                def __init__(self, multiscale_conv, cbam, identity=None):
+                    super().__init__()
+                    self.multiscale = multiscale_conv
+                    self.cbam = cbam
+                    self.identity = identity
+                    
+                def forward(self, x):
+                    out = self.multiscale(x) + self.cbam(x)
+                    if self.identity is not None:
+                        out = out + x
+                    return out
+                    
+            return FusedMultiscaleCbam(multiscale, self.cbam, self.identity)
+        else:
+            return self.mixer.fuse()
+
+# RepViT Channel Mixer
+class RepViTChannelMixer(nn.Module):
+    def __init__(self, in_dim, hidden_dim=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        hidden_dim = hidden_dim or in_dim * 2
+        self.fc1 = ConvNorm(in_dim, hidden_dim, 1, 1, 0)
+        self.act = act_layer()
+        self.fc2 = ConvNorm(hidden_dim, in_dim, 1, 1, 0)
+        self.drop = nn.Dropout(drop) if drop > 0 else nn.Identity()
+        
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+        
+    def fuse(self):
+        fc1 = self.fc1.fuse()
+        fc2 = self.fc2.fuse()
+        
+        class FusedChannelMixer(nn.Module):
+            def __init__(self, fc1, act, fc2, drop):
+                super().__init__()
+                self.fc1 = fc1
+                self.act = act
+                self.fc2 = fc2
+                self.drop = drop
+                
+            def forward(self, x):
+                x = self.fc1(x)
+                x = self.act(x)
+                x = self.drop(x)
+                x = self.fc2(x)
+                x = self.drop(x)
+                return x
+                
+        return FusedChannelMixer(fc1, self.act, fc2, self.drop)
+
+class ACRRepViTBlock(nn.Module):
+    """ACR-RepViT增强块 - 使用增强的重参数化策略"""
+    def __init__(self, in_channels, out_channels, stride=1, mlp_ratio=4., 
+                 act_layer=nn.GELU, drop=0., drop_path=0., 
+                 use_layer_scale=True, layer_scale_init_value=1e-5,
+                 mode='decomposed'):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
+        
+        # 修复下采样层实现，确保通道数匹配
+        if stride > 1 or in_channels != out_channels:
+            # 使用两步下采样确保通道数匹配
+            if in_channels != out_channels:
+                self.downsample = nn.Sequential(
+                    # 先进行下采样
+                    nn.Conv2d(in_channels, in_channels, kernel_size=2, stride=stride, 
+                             padding=0, groups=1, bias=False) if stride > 1 else nn.Identity(),
+                    # 然后调整通道数
+                    ConvNorm(in_channels, out_channels, kernel_size=1, stride=1, pad=0)
+                )
+            else:
+                self.downsample = ConvNorm(in_channels, out_channels, 2, stride, 0)
+        else:
+            self.downsample = None
+        
+        # Token Mixer - 使用ACR重参数化策略
+        self.token_mixer = RepViTTokenMixer(out_channels, mode, 1)
+        
+        # Channel Mixer
+        self.channel_mixer = RepViTChannelMixer(
+            out_channels, 
+            hidden_dim=int(out_channels * mlp_ratio), 
+            act_layer=act_layer, 
+            drop=drop
+        )
+        
+        # Drop Path
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        
+        # Layer Scale
+        self.use_layer_scale = use_layer_scale
+        if use_layer_scale:
+            self.ls1 = nn.Parameter(layer_scale_init_value * torch.ones(out_channels))
+            self.ls2 = nn.Parameter(layer_scale_init_value * torch.ones(out_channels))
+
+    def forward(self, x):
+        # 应用下采样，如果需要
+        if self.downsample is not None:
+            x = self.downsample(x)
+        
+        # 应用Token Mixer并添加残差连接
+        if self.use_layer_scale:
+            x = x + self.drop_path(
+                self.ls1.unsqueeze(-1).unsqueeze(-1) * self.token_mixer(x)
+            )
+        else:
+            x = x + self.drop_path(self.token_mixer(x))
+        
+        # 应用Channel Mixer并添加残差连接
+        if self.use_layer_scale:
+            x = x + self.drop_path(
+                self.ls2.unsqueeze(-1).unsqueeze(-1) * self.channel_mixer(x)
+            )
+        else:
+            x = x + self.drop_path(self.channel_mixer(x))
+        
+        return x
+    
+    def fuse_token_channel_mixers(self):
+        """融合Token和Channel Mixer，用于推理加速"""
+        self.token_mixer = self.token_mixer.fuse()
+        self.channel_mixer = self.channel_mixer.fuse()
+        return self
+
+
+class ACRRepViT(nn.Module):
+    """
+    ACR-RepViT模型 - 使用增强型重参数化策略的RepViT
+    
+    参数:
+        in_chans (int): 输入通道数，默认为3
+        num_classes (int): 分类类别数，默认为1000
+        depths (list): 每个阶段的块数，默认为[2, 2, 6, 2]
+        dims (list): 每个阶段的通道数，默认为[64, 128, 256, 512]
+        token_mixer (str): 重参数化策略，可选值为'decomposed'、'multiscale'、'attention'、'combined'
+        mlp_ratio (float): MLP扩展率，默认为4.0
+        drop_rate (float): 丢弃率，默认为0.0
+        drop_path_rate (float): 路径丢弃率，默认为0.0
+        patch_size (int): Patch大小，默认为7
+        norm_layer: 归一化层类型，默认为nn.BatchNorm2d
+        layer_scale_init_value (float): 层缩放初始值，默认为1e-5
+        distillation (bool): 是否启用蒸馏，默认为False
+    """
+    def __init__(self, in_chans=3, num_classes=1000, depths=[2, 2, 6, 2], 
+                 dims=[64, 128, 256, 512], token_mixer='decomposed',
+                 mlp_ratio=4., drop_rate=0., drop_path_rate=0., 
+                 patch_size=7, norm_layer=nn.BatchNorm2d, 
+                 layer_scale_init_value=1e-5, distillation=False, **kwargs):
+        super().__init__()
+        
+        # 保存一些主要配置参数，用于后续使用
+        self.depths = depths
+        self.embed_dims = dims
+        self.num_classes = num_classes
+        self.reparam_type = token_mixer  # 记录重参数化类型
+        self.distillation = distillation  # 保存蒸馏参数
+        
+        # 将token_mixer字符串转换为实际使用的模式
+        if isinstance(token_mixer, str):
+            if token_mixer == 'decomposed':
+                self.mode = 'decomposed'
+            elif token_mixer == 'multiscale':
+                self.mode = 'multiscale'
+            elif token_mixer == 'attention':
+                self.mode = 'attention'
+            elif token_mixer == 'combined':
+                # 组合模式使用所有增强重参数化方法
+                self.mode = 'combined'
+            else:
+                # 默认使用分解卷积重参数化
+                self.mode = 'decomposed'
+        else:
+            # 如果传入的不是字符串，则默认使用分解卷积
+            self.mode = 'decomposed'
+        
+        self.num_stages = len(depths)
+        
+        # 构建Stem层
+        self.stem = nn.Sequential(
+            ConvNorm(in_chans, dims[0], kernel_size=patch_size, stride=4, 
+                    pad=patch_size // 2),
+            act_layer()
+        )
+        
+        # 随机深度衰减率
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+        
+        # 构建各个阶段
+        self.stages = nn.ModuleList()
+        curr_block = 0
+        
+        for i in range(self.num_stages):
+            # 修复通道维度处理，确保每个阶段的输入输出通道正确
+            stage_blocks = []
+            
+            for j in range(depths[i]):
+                # 确定当前块的输入通道
+                if j == 0:  # 每个阶段的第一个块
+                    if i == 0:  # 第一个阶段
+                        in_chs = dims[0]
+                    else:  # 其他阶段的第一个块，从上一个阶段获取通道数
+                        in_chs = dims[i-1]
+                else:  # 阶段内部的块
+                    in_chs = dims[i]
+                
+                # 确定当前块的输出通道和步长
+                out_chs = dims[i]
+                # 除了第一个阶段，每个阶段的第一个块都需要下采样
+                stride = 2 if j == 0 and i > 0 else 1
+                
+                # 创建块并添加到当前阶段
+                block = ACRRepViTBlock(
+                    in_channels=in_chs,
+                    out_channels=out_chs,
+                    stride=stride,
+                    mlp_ratio=mlp_ratio,
+                    drop=drop_rate,
+                    drop_path=dpr[curr_block + j],
+                    use_layer_scale=True,
+                    layer_scale_init_value=layer_scale_init_value,
+                    mode=self.mode
+                )
+                stage_blocks.append(block)
+            
+            # 将当前阶段添加到stages
+            self.stages.append(nn.Sequential(*stage_blocks))
+            curr_block += depths[i]
+        
+        # 分类头
+        self.norm = norm_layer(dims[-1])
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.head = nn.Linear(dims[-1], num_classes) if num_classes > 0 else nn.Identity()
+        
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, m):
+        """初始化模型权重"""
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+    
+    def forward_features(self, x):
+        """特征提取部分的前向传播"""
+        x = self.stem(x)
+        
+        for stage in self.stages:
+            x = stage(x)
+        
+        return x
+
+    def forward(self, x):
+        """整个模型的前向传播"""
+        x = self.forward_features(x)
+        x = self.norm(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        
+        if self.distillation and self.training:
+            # 如果启用蒸馏且处于训练模式，返回两个相同的结果
+            # 这是为了兼容蒸馏训练代码的简化做法
+            return self.head(x), self.head(x) 
+        return self.head(x)
+    
+    def load_pretrained(self, checkpoint_path):
+        """加载预训练权重但不做严格匹配
+        
+        Args:
+            checkpoint_path: 预训练模型路径
+        """
+        print(f"加载预训练权重: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        # 处理不同结构的预训练权重
+        if 'model' in checkpoint:
+            pretrained_dict = checkpoint['model']
+        else:
+            pretrained_dict = checkpoint
+            
+        # 获取当前模型的状态字典
+        model_dict = self.state_dict()
+        
+        # 过滤掉不匹配的键值
+        filtered_dict = {}
+        for k, v in pretrained_dict.items():
+            if k in model_dict and model_dict[k].shape == v.shape:
+                filtered_dict[k] = v
+                
+        # 打印加载情况
+        print(f"成功加载了 {len(filtered_dict)}/{len(model_dict)} 参数")
+        print(f"未加载的参数: {len(model_dict) - len(filtered_dict)}")
+        
+        # 更新模型参数
+        model_dict.update(filtered_dict)
+        self.load_state_dict(model_dict)
+    
+    def fuse_model(self):
+        """融合模型中的所有重参数化块，用于推理加速"""
+        print("开始融合模型...")
+        
+        # 融合Stem层
+        if isinstance(self.stem[0], ConvNorm):
+            self.stem[0] = self.stem[0].fuse()
+        
+        # 融合各个阶段
+        for stage_idx, stage in enumerate(self.stages):
+            for block_idx, block in enumerate(stage):
+                # 融合下采样层
+                if block.downsample is not None:
+                    if isinstance(block.downsample, ConvNorm):
+                        block.downsample = block.downsample.fuse()
+                    elif isinstance(block.downsample, nn.Sequential):
+                        for i, layer in enumerate(block.downsample):
+                            if isinstance(layer, ConvNorm):
+                                block.downsample[i] = layer.fuse()
+                
+                # 融合Token Mixer和Channel Mixer
+                block.fuse_token_channel_mixers()
+                
+        print("模型融合完成")
+        return self
+
+@register_model
+def acr_repvit_m0_9(pretrained=False, **kwargs):
+    """ACR-RepViT-M0.9模型"""
+    model = ACRRepViT(depths=[3, 3, 9, 3], dims=[48, 96, 192, 384], 
+                     mlp_ratio=2.0, **kwargs)
+    return model
+
+@register_model
+def acr_repvit_m0_9_decomposed(pretrained=False, **kwargs):
+    """ACR-RepViT-M0.9分解卷积重参数化变体"""
+    model = ACRRepViT(depths=[3, 3, 9, 3], dims=[48, 96, 192, 384], 
+                     mlp_ratio=2.0, token_mixer='decomposed', **kwargs)
+    return model
+
+@register_model
+def acr_repvit_m0_9_multiscale(pretrained=False, **kwargs):
+    """ACR-RepViT-M0.9多尺度重参数化变体"""
+    model = ACRRepViT(depths=[3, 3, 9, 3], dims=[48, 96, 192, 384], 
+                     mlp_ratio=2.0, token_mixer='multiscale', **kwargs)
+    return model
+
+@register_model
+def acr_repvit_m0_9_attention(pretrained=False, **kwargs):
+    """ACR-RepViT-M0.9注意力增强重参数化变体"""
+    model = ACRRepViT(depths=[3, 3, 9, 3], dims=[48, 96, 192, 384],
+                     mlp_ratio=2.0, token_mixer='attention', **kwargs)
+    return model
+
+@register_model
+def acr_repvit_m0_9_cbam(pretrained=False, **kwargs):
+    """ACR-RepViT-M0.9 CBAM注意力增强变体"""
+    model = ACRRepViT(depths=[3, 3, 9, 3], dims=[48, 96, 192, 384],
+                     mlp_ratio=4.0, token_mixer='cbam', **kwargs)
+    return model
+
+@register_model
+def acr_repvit_m0_9_combined(pretrained=False, **kwargs):
+    """ACR-RepViT-M0.9组合增强重参数化变体"""
+    model = ACRRepViT(depths=[3, 3, 9, 3], dims=[48, 96, 192, 384],
+                     mlp_ratio=2.0, token_mixer='combined', **kwargs)
+    return model
+
+@register_model
+def acr_repvit_m1_0(pretrained=False, **kwargs):
+    """ACR-RepViT-M1.0模型 - 中型"""
+    model = ACRRepViT(depths=[4, 4, 12, 4], dims=[64, 128, 256, 512], 
+                       mlp_ratio=4.0, token_mixer="decomposed", **kwargs)
+    return model
+
+@register_model
+def acr_repvit_m1_0_decomposed(pretrained=False, **kwargs):
+    """ACR-RepViT-M1.0分解卷积变种"""
+    model = ACRRepViT(depths=[4, 4, 12, 4], dims=[64, 128, 256, 512], 
+                       mlp_ratio=4.0, token_mixer="decomposed", **kwargs)
+    return model
+
+@register_model
+def acr_repvit_m1_1(pretrained=False, **kwargs):
+    """ACR-RepViT-M1.1模型 - 大型"""
+    model = ACRRepViT(depths=[4, 4, 14, 4], dims=[64, 128, 256, 512], 
+                       mlp_ratio=4.0, token_mixer="decomposed", **kwargs)
+    return model
+
+@register_model
+def acr_repvit_m1_0_multiscale(pretrained=False, **kwargs):
+    """ACR-RepViT-M1.0多尺度变种"""
+    model = ACRRepViT(depths=[4, 4, 12, 4], dims=[64, 128, 256, 512], 
+                       mlp_ratio=4.0, token_mixer="multiscale", **kwargs)
+    return model
+
+@register_model
+def acr_repvit_m1_0_attention(pretrained=False, **kwargs):
+    """ACR-RepViT-M1.0注意力增强变种"""
+    model = ACRRepViT(depths=[4, 4, 12, 4], dims=[64, 128, 256, 512], 
+                       mlp_ratio=4.0, token_mixer="attention", **kwargs)
+    return model
+
+@register_model
+def acr_repvit_m1_0_combined(pretrained=False, **kwargs):
+    """ACR-RepViT-M1.0组合增强变种"""
+    model = ACRRepViT(depths=[4, 4, 12, 4], dims=[64, 128, 256, 512], 
+                       mlp_ratio=4.0, token_mixer="combined", **kwargs)
+    return model
+
+@register_model
+def acr_repvit_m1_5(pretrained=False, **kwargs):
+    """ACR-RepViT-M1.5模型 - 更大型号"""
+    model = ACRRepViT(depths=[8, 8, 16, 4], dims=[64, 128, 256, 512], 
+                       mlp_ratio=4.0, token_mixer="combined", **kwargs)
+    return model
+
+@register_model
+def acr_repvit_m2_3(pretrained=False, **kwargs):
+    """ACR-RepViT-M2.3模型 - 最大型号"""
+    model = ACRRepViT(depths=[8, 8, 24, 4], dims=[96, 192, 384, 768], 
+                       mlp_ratio=4.0, token_mixer="combined", **kwargs)
+    return model
+
+@register_model
+def acr_repvit_m0_9_ca(pretrained=False, **kwargs):
+    """ACR-RepViT-M0.9-CA变体，只使用通道注意力"""
+    model = ACRRepViT(
+        depths=[1, 2, 4, 1], dims=[48, 96, 192, 384], token_mixer='ca_only', **kwargs
+    )
+    return model
+    
+@register_model
+def acr_repvit_m0_9_sa(pretrained=False, **kwargs):
+    """ACR-RepViT-M0.9-SA变体，只使用空间注意力"""
+    model = ACRRepViT(
+        depths=[1, 2, 4, 1], dims=[48, 96, 192, 384], token_mixer='sa_only', **kwargs
+    )
+    return model 
